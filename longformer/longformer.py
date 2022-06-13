@@ -104,13 +104,14 @@ class LongformerSelfAttention(nn.Module):
         assert encoder_attention_mask is None, "`encoder_attention_mask` is not supported and shiould be None"
 
         if attention_mask is not None:
-            attention_mask = attention_mask.squeeze(dim=2).squeeze(dim=1)
+            # attention_mask = attention_mask.squeeze(dim=2).squeeze(dim=1)
             key_padding_mask = attention_mask < 0
             extra_attention_mask = attention_mask > 0
             remove_from_windowed_attention_mask = attention_mask != 0
 
-            num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
-            max_num_extra_indices_per_batch = num_extra_indices_per_batch.max()
+            num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)            
+            max_num_extra_indices_per_batch = num_extra_indices_per_batch.max().item()
+
             if max_num_extra_indices_per_batch <= 0:
                 extra_attention_mask = None
             else:
@@ -132,8 +133,9 @@ class LongformerSelfAttention(nn.Module):
             extra_attention_mask = None
             key_padding_mask = None
 
-        hidden_states = hidden_states.transpose(0, 1)
+        # hidden_states = hidden_states.transpose(0, 1)
         seq_len, bsz, embed_dim = hidden_states.size()
+
         assert embed_dim == self.embed_dim
         q = self.query(hidden_states)
         k = self.key(hidden_states)
@@ -146,34 +148,40 @@ class LongformerSelfAttention(nn.Module):
         if self.attention_mode == 'tvm':
             q = q.float().contiguous()
             k = k.float().contiguous()
-            attn_weights = diagonaled_mm_tvm(q, k, self.attention_window, self.attention_dilation, False, 0, False)
+            attn_weights = diagonaled_mm_tvm(q, k, self.attention_window, self.attention_dilation, False, 0, self.autoregressive)
         elif self.attention_mode == "sliding_chunks":
             attn_weights = sliding_chunks_matmul_qk(q, k, self.attention_window, padding_value=0)
         elif self.attention_mode == "sliding_chunks_no_overlap":
             attn_weights = sliding_chunks_no_overlap_matmul_qk(q, k, self.attention_window, padding_value=0)
         else:
             raise False
-        mask_invalid_locations(attn_weights, self.attention_window, self.attention_dilation, False)
+        mask_invalid_locations(attn_weights, self.attention_window, self.attention_dilation, self.autoregressive)
         if remove_from_windowed_attention_mask is not None:
             # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
             # from (bsz x seq_len) to (bsz x seq_len x num_heads x hidden_size)
             remove_from_windowed_attention_mask = remove_from_windowed_attention_mask.unsqueeze(dim=-1).unsqueeze(dim=-1)
             # cast to float/half then replace 1's with -inf
-            float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(remove_from_windowed_attention_mask, -10000.0)
-            repeat_size = 1 if isinstance(self.attention_dilation, int) else len(self.attention_dilation)
+            float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(remove_from_windowed_attention_mask, -10000.0)        
+            # repeat_size = 1 if isinstance(self.attention_dilation, int) else len(self.attention_dilation) # before
+            repeat_size = self.num_heads
+
             float_mask = float_mask.repeat(1, 1, repeat_size, 1)
             ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
             # diagonal mask with zeros everywhere and -inf inplace of padding
             if self.attention_mode == 'tvm':
-                d_mask = diagonaled_mm_tvm(ones, float_mask, self.attention_window, self.attention_dilation, False, 0, False)
+                d_mask = diagonaled_mm_tvm(ones, float_mask, self.attention_window, self.attention_dilation, False, 0, self.autoregressive)
             elif self.attention_mode == "sliding_chunks":
                 d_mask = sliding_chunks_matmul_qk(ones, float_mask, self.attention_window, padding_value=0)
             elif self.attention_mode == "sliding_chunks_no_overlap":
                 d_mask = sliding_chunks_no_overlap_matmul_qk(ones, float_mask, self.attention_window, padding_value=0)
 
             attn_weights += d_mask
+
         assert list(attn_weights.size())[:3] == [bsz, seq_len, self.num_heads]
-        assert attn_weights.size(dim=3) in [self.attention_window * 2 + 1, self.attention_window * 3]
+        if self.autoregressive:
+            assert attn_weights.size(dim=3) in [self.attention_window + 1, self.attention_window * 2]
+        else:
+            assert attn_weights.size(dim=3) in [self.attention_window * 2 + 1, self.attention_window * 3]
 
         # the extra attention
         if extra_attention_mask is not None:
@@ -204,7 +212,7 @@ class LongformerSelfAttention(nn.Module):
 
         if self.attention_mode == 'tvm':
             v = v.float().contiguous()
-            attn += diagonaled_mm_tvm(attn_probs, v, self.attention_window, self.attention_dilation, True, 0, False)
+            attn += diagonaled_mm_tvm(attn_probs, v, self.attention_window, self.attention_dilation, True, 0, self.autoregressive)
         elif self.attention_mode == "sliding_chunks":
             attn += sliding_chunks_matmul_pv(attn_probs, v, self.attention_window)
         elif self.attention_mode == "sliding_chunks_no_overlap":
@@ -250,7 +258,8 @@ class LongformerSelfAttention(nn.Module):
             nonzero_selected_attn = selected_attn_4d[selection_padding_mask_nonzeros[0], :, selection_padding_mask_nonzeros[1]]
             attn[extra_attention_mask_nonzeros[::-1]] = nonzero_selected_attn.view(len(selection_padding_mask_nonzeros[0]), -1).type_as(hidden_states)
 
-        context_layer = attn.transpose(0, 1)
+        # context_layer = attn.transpose(0, 1)
+        context_layer = attn
         if output_attentions:
             if extra_attention_mask is not None:
                 # With global attention, return global attention probabilities only
