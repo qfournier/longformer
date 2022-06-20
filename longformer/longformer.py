@@ -198,6 +198,11 @@ class LongformerSelfAttention(nn.Module):
             # softmax sometimes inserts NaN if all positions are masked, replace them with 0
             attn_weights_float = torch.masked_fill(attn_weights_float, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
         attn_weights = attn_weights_float.type_as(attn_weights)
+        
+        attn_weights_local = None
+        if output_attentions:
+            attn_weights_local = attn_weights
+        
         attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
         v = v.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
         attn = 0
@@ -268,11 +273,18 @@ class LongformerSelfAttention(nn.Module):
                 # It doesn't not return local attention
                 # In case of variable number of global attantion in the rows of a batch,
                 # attn_weights are padded with -10000.0 attention scores
-                attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)
+                # attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)
+                attn_weights = attn_weights.view(bsz, self.num_heads, seq_len, max_num_extra_indices_per_batch)#.permute(0, 1, 3, 2)
+                # attn_weights = (batch_size x num_heads x sequence_length x max_num_global_attention_tokens)
+                
             else:
                 # without global attention, return local attention probabilities
                 # batch_size x num_heads x sequence_length x window_size
                 # which is the attention weights of every token attending to its neighbours
                 attn_weights = attn_weights.permute(0, 2, 1, 3)
-        outputs = (context_layer, attn_weights) if output_attentions else (context_layer,)
+        
+            attn_weights_local = attn_weights_local.permute(0, 2, 1, 3)
+
+        outputs = (context_layer, attn_weights_local, attn_weights) if output_attentions else (context_layer,)
+
         return outputs
